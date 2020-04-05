@@ -1,0 +1,575 @@
+Description: >
+  Deploy a High-Availability Web App using CloudFormation
+
+Parameters:
+  EnvironmentName:
+    Description: High-Availability Web App
+    Type: String
+
+  EC2ImageID:
+    Description: An image ID for EC2 Instance
+    Type: String
+    Default: "ami-0d1cd67c26f5fca19"
+
+  KeyPairName:
+    Description: Name of the key-pair file(PEM for OpenSSH, PPK for Putty)
+    Type: String
+    Default: "custom-key-pair"
+
+  InstanceType:
+    Description: The type of the EC2 Instance
+    Type: String
+    Default: "t3.medium"
+
+  S3CodeRepo:
+    Description: Full S3 path and file name of zipped file
+    Type: String
+    Default: "s3://udacity-webapp-files/udacity.zip"
+
+  WebAppServersMinSize:
+    Description: Minimum number of web application servers
+    Type: String
+    Default: "2"
+
+  WebAppServersMaxSize:
+    Description: Maximum number of web application servers
+    Type: String
+    Default: "4"
+
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.0.0/24
+
+  PublicSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
+    Type: String
+    Default: 10.0.3.0/24
+
+Resources:
+  AutoScalingLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt update -y
+          sudo apt install unzip awscli -y
+          mkdir html
+          aws s3 cp ${S3CodeRepo} html
+          unzip -o html/udacity.zip -d html
+          sudo chown -R www-data:www-data html
+          apt-get -y install apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+          sudo apt-key fingerprint 0EBFCD88
+          sudo add-apt-repository \
+            "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) \
+            stable"
+          apt-get update
+          apt-get -y install docker-ce docker-ce-cli containerd.io
+          usermod -aG docker ubuntu
+          docker run -dit --name ${EnvironmentName} -p 80:80 -v "$PWD"/html:/usr/local/apache2/htdocs/ httpd:latest
+      ImageId: !Ref EC2ImageID
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+        - !Ref AutoScalingSecurityGroup
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchConfigurationName: !Ref AutoScalingLaunchConfiguration
+      MinSize: !Ref WebAppServersMinSize
+      MaxSize: !Ref WebAppServersMaxSize
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+      TargetGroupARNs:
+        - !Ref LoadBalancerTargetGroup
+
+  AutoScalingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for web server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - SourceSecurityGroupId: !Ref EC2BastionSecurityGroup
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Auto Scaling Security Group
+
+  EC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2ImageID
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: "true"
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          SubnetId: !Ref PublicSubnet1
+          GroupSet:
+            - !Ref EC2BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Bastion Host 1
+
+  EC2Instance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2ImageID
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: "true"
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          SubnetId: !Ref PublicSubnet2
+          GroupSet:
+            - !Ref EC2BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Bastion Host 2
+
+  EC2InstanceWebApp1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2ImageID
+      InstanceType: !Ref InstanceType
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: "true"
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "false"
+          DeviceIndex: "0"
+          SubnetId: !Ref PrivateSubnet1
+          GroupSet:
+            - !Ref AutoScalingSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} EC2 Server Host in Private Subnet 1
+
+  EC2InstanceWebApp2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2ImageID
+      InstanceType: !Ref InstanceType
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: "true"
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "false"
+          DeviceIndex: "0"
+          SubnetId: !Ref PrivateSubnet2
+          GroupSet:
+            - !Ref AutoScalingSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} EC2 Server Host in Private Subnet 2
+
+  EC2InstanceWebApp3:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2ImageID
+      InstanceType: !Ref InstanceType
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: "true"
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "false"
+          DeviceIndex: "0"
+          SubnetId: !Ref PrivateSubnet1
+          GroupSet:
+            - !Ref AutoScalingSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} EC2 Server Host in Private Subnet 3
+
+  EC2InstanceWebApp4:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2ImageID
+      InstanceType: !Ref InstanceType
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: "true"
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "false"
+          DeviceIndex: "0"
+          SubnetId: !Ref PrivateSubnet2
+          GroupSet:
+            - !Ref AutoScalingSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} EC2 Server Host in Private Subnet 4
+
+  EC2BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Bastion Hosting
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Bastion Security Group
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref EnvironmentName
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Load Balancer
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Load Balancer Security Group
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: "80"
+      Protocol: "HTTP"
+
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 20
+      HealthCheckPath: /
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      Port: 80
+      Matcher:
+        HttpCode: "200"
+      Targets:
+        - Id: !Ref EC2InstanceWebApp1
+          Port: 80
+        - Id: !Ref EC2InstanceWebApp2
+          Port: 80
+        - Id: !Ref EC2InstanceWebApp3
+          Port: 80
+        - Id: !Ref EC2InstanceWebApp4
+          Port: 80
+      Protocol: "HTTP"
+      UnhealthyThresholdCount: 5
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Load Balancer Target Group
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref S3BucketRole
+
+  S3BucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: "AllowS3"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "s3:*"
+                Resource: "*"
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ1)
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ2)
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ1)
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ2)
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ1)
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ2)
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: DNS Name of the web application
+    Value: !Join ["", ["http://", !GetAtt LoadBalancer.DNSName]]
+    Export:
+      Name: !Sub "${EnvironmentName}-DNS-NAME"
+
+  BastionHostIPPublicSubnet1:
+    Description: IP address of bastion host in public subnet 1
+    Value: !GetAtt EC2Instance1.PublicIp
+    Export:
+      Name: !Sub "${EnvironmentName}-BASTION-HOST-IP-PUBLIC-SUBNET-1"
+
+  BastionHostIPPublicSubnet2:
+    Description: IP address of bastion host in public subnet 2
+    Value: !GetAtt EC2Instance2.PublicIp
+    Export:
+      Name: !Sub "${EnvironmentName}-BASTION-HOST-IP-PUBLIC-SUBNET-2"
+
+  BastionHostDNSPublicSubnet1:
+    Description: DNS address of bastion host in public subnet 1
+    Value: !GetAtt EC2Instance1.PublicDnsName
+    Export:
+      Name: !Sub "${EnvironmentName}-BASTION-HOST-DNS-PUBLIC-SUBNET-1"
+
+  BastionHostDNSPublicSubnet2:
+    Description: DNS address of bastion host in public subnet 2
+    Value: !GetAtt EC2Instance2.PublicDnsName
+    Export:
+      Name: !Sub "${EnvironmentName}-BASTION-HOST-DNS-PUBLIC-SUBNET-2"
+
+  VPC:
+    Description: A reference to the created VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${EnvironmentName}-VPCID
+
+  PublicSubnets:
+    Description: A list of the public subnets
+    Value: !Join [",", [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub ${EnvironmentName}-PUB-NETS
+
+  PrivateSubnets:
+    Description: A list of the private subnets
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub ${EnvironmentName}-PRIV-NETS
